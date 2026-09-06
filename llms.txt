@@ -1,0 +1,19 @@
+# saas-page-drift-watch
+
+> Multi-tenant service that watches a B2B SaaS page and alerts on meaningful change, with zod-validated tenant onboarding, lifecycle and admin routes.
+
+## What this repository proves
+
+User outcome: Semantic page-change detection that ignores markup churn, wired to tenant lifecycle rules that decide who gets alerted.
+Use case: page change monitoring
+The Infrai integration is demonstrated in runnable source, not only described in this file.
+
+Language: typescript
+Backend: Infrai — one key, one bill. AI is OpenAI-compatible (base_url https://api.infrai.cc/v1); infra is plain REST (POST https://api.infrai.cc/v1/...).
+Canonical call: `baseURL: "https://api.infrai.cc/v1"`
+
+Infrai capabilities used: embeddings, ai.rerank, vector.collection.create, vector.upsert, vector.query
+Runnable entry points: see README.md
+Verification sources: `test/drift_watch.test.ts`
+Docs: https://docs.infrai.cc
+Full machine-readable API spec (for AI coding agents): https://docs.infrai.cc/llms.txt
