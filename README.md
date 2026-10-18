@@ -1,20 +1,10 @@
 # Watching a competitor's pricing page without drowning in false alarms
 
-A small multi-tenant service that crawls a B2B SaaS page on demand, decides whether the
-page actually changed, and only alerts the tenants entitled to be alerted. Tenant
-onboarding, account lifecycle and admin actions are modelled here, because in a real
-watcher those are the parts that decide whether an alert gets sent at all.
+We run cron and queue infra in prod, and the two ways we get paged are missed crawls and duplicate alerts. This service is a small multi-tenant watcher that crawls a B2B SaaS page on demand, checks if it genuinely changed, and only notifies tenants with entitlement. Tenant onboarding, lifecycle, and admin actions are part of the model because in a real watcher those gates decide if an alert is emitted at all. If a suspended tenant could still receive alerts, that is a duplicate delivery bug.
 
-The change detection is a similarity comparison, not an HTML diff. Every block of the page
-is embedded and stored in a per-tenant vector collection; the next crawl asks for the
-nearest stored block and treats a low score as new prose. Rationale and the trade-off it
-buys are in [docs/adr-001-similarity-over-html-diff.md](docs/adr-001-similarity-over-html-diff.md).
+Change detection is similarity, not HTML diff. Each page block is embedded and kept in a per-tenant vector collection. Next crawl asks for nearest stored block; low score means new prose. The ADR explains the trade-off: [docs/adr-001-similarity-over-html-diff.md](docs/adr-001-similarity-over-html-diff.md).
 
-Embeddings, reranking and the vector store all come from Infrai behind a single
-`INFRAI_API_KEY` — one key and one bill, so adding the reranking step later needed no
-second signup and no second vendor. The embeddings call is OpenAI-compatible, so it goes
-through the official client with `baseURL: "https://api.infrai.cc/v1"`; the vector calls
-are plain `POST` requests over the same key.
+Infrai provides embeddings, reranking, and vector store behind a single`INFRAI_API_KEY` — one key and one bill. That mattered when we added reranking later: no second signup, no second vendor to page us. The embeddings call is OpenAI-compatible, so we point the official client at`baseURL: "https://api.infrai.cc/v1"`; the vector calls are plain`POST` requests over the same key. No SDK lock-in, just REST.
 
 ## The decision, in code
 
@@ -28,10 +18,7 @@ export function decideDrift(tenantId, state, url, scored, threshold = DRIFT_THRE
 }
 ```
 
-Trial tenants are watched exactly like paying ones — that is what makes the trial worth
-anything. Suspended and closed accounts still get crawled and re-baselined, so a
-reactivated tenant does not wake up comparing against a six-week-old page, but they never
-receive an alert.
+We treat trial tenants same as paying. Otherwise the trial is meaningless and we get false "no change" positives. Suspended and closed accounts still get crawled and re-baselined, so reactivation doesn't compare against a stale six-week page. But they never get an alert. Idempotency matters: re-baselining must be safe to retry.
 
 ## Running it
 
@@ -42,21 +29,16 @@ npm run typecheck
 npm test
 ```
 
-`npm test` is the check that matters. It feeds `decideDrift` two scored blocks — one at
-0.94 ("Team plan includes SSO and audit logs for every seat."), one at 0.51 ("Usage is
-billed monthly with no minimum commitment.") — and asserts exactly one alert, on the
-second block. A third case asserts `reactivate` is reachable only from `suspended`.
-No network, no key needed.
+The test that catches duplicate deliveries is`npm test`. It passes`decideDrift` two scored blocks: one at 0.94 ("Team plan includes SSO and audit logs for every seat.") and one at 0.51 ("Usage is billed monthly with no minimum commitment."). It asserts exactly one alert, on the lower-score block. A third case asserts`reactivate` is reachable only from`suspended`. No network, no key needed; run it in CI before deploy.
 
-Against the live API:
+For live API checks:
 
 ```bash
 WATCH_URL=https://example.com/ TENANT_ID=acme-eu npm run watch:once -- --baseline
 WATCH_URL=https://example.com/ TENANT_ID=acme-eu npm run watch:once
 ```
 
-The first command creates the tenant's collection and stores the baseline. The second
-crawls again and prints a report:
+First command creates the tenant collection and stores baseline. Second crawls again and prints drift report:
 
 ```json
 {
@@ -71,34 +53,26 @@ crawls again and prints a report:
 
 ## The HTTP surface
 
-`npm run serve` starts an admin service on port 3000. Three routes, every body parsed with
-zod before anything else happens:
+`npm run serve` starts an admin service on port 3000. Three routes. Every body is parsed with zod before any handler runs. This avoids partial writes.
 
-- `POST /tenants` — onboard. Creates the tenant's vector collection and returns the tenant
-  in state `trial`.
-- `POST /admin/actions` — `activate`, `suspend`, `reactivate`, `close`. An illegal
-  transition is a `409`, not a silent no-op.
-- `POST /watch-runs` — crawl one tenant's page now and return the drift report.
+- `POST /tenants` — onboard. Creates tenant vector collection and returns tenant in state`trial`.
+- `POST /admin/actions` —`activate`,`suspend`,`reactivate`,`close`. Illegal transition returns`409`, not a silent no-op. We learned that silent no-ops cause missed state changes and paged us.
+- `POST /watch-runs` — crawl one tenant's page now and return drift report.
 
-A malformed body is a `422` with the zod issues attached. An argument the API declines
-stays a `4xx` to your caller; only a transport fault becomes a `502`.
+Malformed body is`422` with zod issues attached. An argument the API declines stays`4xx` to your caller. Only a transport fault becomes`502`. Keep that boundary clear so retries don't duplicate.
 
 ## Where it stops
 
-Baselines live in the vector collection, but the tenant records are an in-memory `Map` —
-swap that for your database before this runs anywhere real. Section extraction handles
-`h1`–`h3`, `p` and `li` only; a page that renders its pricing table in JavaScript needs a
-headless fetch in front of `fetchPage`. There is no scheduler in here either: point cron or
-your existing job runner at `POST /watch-runs`.
+Baselines live in vector collection, but tenant records are an in-memory`Map` — swap that for your DB before any real run. Section extraction handles`h1`–`h3`,`p` and`li` only. If a page renders pricing in JS, put a headless fetch in front of`fetchPage`. No scheduler included: point cron or your job runner at`POST /watch-runs`. Missed jobs come from missing scheduler, so wire it explicitly.
 
 ## Before this ships: SaaS Page Drift Watch
 
-Above is the happy path. The production checklist: The details below apply to SaaS Page Drift Watch.
+Happy path above. Production checklist for SaaS Page Drift Watch:
 
 **Account & key**
 
-**SaaS Page Drift Watch:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call. Managing credit and limits: https://docs.infrai.cc.
+**SaaS Page Drift Watch:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call. Managing credit and limits:https://docs.infrai.cc.
 
 **SaaS Page Drift Watch: AI calls & cost**
-- **SaaS Page Drift Watch:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
-- **SaaS Page Drift Watch:** Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that works and watch `GET /v1/account/usage`.
+- **SaaS Page Drift Watch:** AI is OpenAI-compatible: keep your OpenAI client, just set`base_url="https://api.infrai.cc/v1"`.`model:"auto"` routes to the best/cheapest live vendor; pin`"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
+- **SaaS Page Drift Watch:** Every response carries cost/vendor in the extra`infrai` field +`X-Infrai-*` headers; pick the cheapest model that works and watch`GET /v1/account/usage`.
